@@ -1,105 +1,108 @@
 # ⚡ Cerberus V3.2
 **Multi-Asset, Multi-Timeframe Directional Maker-First Probability Arbitrage Engine**
 
-Cerberus V3.2 is an ultra-low latency trading engine built to exploit probabilistic mispricing on Polymarket's Binary Options (Crypto Markets) using a Numba-JIT Logistic Regression engine and a highly asynchronous 6-Layer WebSocket Sanitizer.
+Cerberus V3.2 is an ultra-low latency, production-grade SRE trading engine built to exploit probabilistic mispricing on Polymarket's Binary Options (Crypto Markets) using a Logistic Regression engine and a highly asynchronous 6-Layer WebSocket Sanitizer.
 
 ---
 
 ## ⚙️ System Architecture
 
-* **6-Layer WebSocket Sanitizer:** Multiplexes 150+ parallel WebSockets across Binance and Polymarket to ensure jitter-free, ultra-low latency data feeds.
+* **Market Workers:** 6 isolated asynchronous coroutines (BTC/ETH across 5M, 15M, 1H) ensuring one market's network failure does not crash the engine.
+* **Strike Discovery (Gamma API):** Automatically parses strike prices from question text using live Polymarket slugs (`btc-updown-5m-{ts}`, etc).
 * **Dual-Threat Execution:** 
-  * *Ambusher (Maker-First):* Automatically posts liquidity at `best_bid + 0.01` to capture spreads and avoid taker fees.
-  * *Directional Sniper (Taker Fallback):* Sweeps the orderbook aggressively using VWAP slippage curves when extreme mispricing is detected.
-* **GhostShield:** 3-Phase verification system to prevent API state desynchronization (Ghost Fills).
-* **Dead Man's Switch & Risk Brain:** Centralized risk unit to enforce global max drawdowns and automatic emergency liquidations.
+  * *Ambusher (Maker-First):* Automatically posts liquidity at `best_bid + 0.01` to capture spreads and avoid taker fees. Uses **fee-aware dynamic spread thresholds** (`C_CRYPTO=0.9984`).
+  * *Directional Sniper (Taker Fallback):* Sweeps the orderbook aggressively when extreme mispricing is detected.
+* **GhostShield:** 3-Phase verification system (WS → REST → Reconciliation) to prevent API state desynchronization (Ghost Fills) with UNVERIFIED state tracking.
+* **Dead Man's Switch & Risk Brain:** Centralized risk unit enforcing global max drawdowns, per-asset hourly loss limits, consecutive loss limits, and 30-second post-fill **Adverse Selection** checks.
 
 ---
 
-## 🛠️ Installation Tutorial
+## 🚀 Deployment (VPS / Production)
 
-### 1. Requirements
-* Python 3.10+
-* Node.js & npm (For the Mission Control Dashboard)
-* A Polymarket Account (with Polygon USDC.e deposited)
+Cerberus is designed to be deployed to a Linux VPS (Ubuntu/Debian) directly from your Windows machine using the provided 1-click deployment script.
 
-### 2. Setup Environment
-Clone or navigate to the Cerberus workspace, then install the Python dependencies:
-```bash
-pip install -r requirements.txt
+### 1. Deploy to VPS
+From your local Windows machine, double-click the deployment script:
+```cmd
+deploy_to_vps.bat
 ```
+*(Script ini akan memaketkan kode (tanpa .env/.git/logs), mengirimnya via `scp` ke `root@204.168.229.145`, mengekstraknya, dan menjalankan `vps_setup.sh` secara otomatis).*
 
-### 3. Configure `.env`
-Copy the example environment file:
+### 2. Konfigurasi Kredensial (.env)
+Setelah deploy selesai, masuk ke VPS via SSH:
 ```bash
-cp .env.example .env
+ssh root@204.168.229.145
+cd /root/cerberus
+nano .env
 ```
-Inside `.env`, you must provide:
-* `POLYMARKET_PRIVATE_KEY` (Your Polygon Wallet Private Key)
-* `TELEGRAM_BOT_TOKEN` & `TELEGRAM_CHAT_ID` (For Telegram alerts)
+Isi konfigurasi wajib:
+* `POLYMARKET_WALLET_PRIVATE_KEY`
+* `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_API_PASSPHRASE`
+* `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+* **Pastikan `DRY_RUN=true` untuk testing awal.**
 
-### 4. Generate Polymarket V2 API Credentials
-Polymarket V2 uses L2 Signature API Keys. We provide a utility script to generate these safely from your private key.
-Run the script:
+### 3. Start Engine (Systemd)
+Deployment script sudah membuat systemd service `cerberus`. Anda tinggal menyalakannya:
 ```bash
-python api.py
+systemctl start cerberus
+systemctl enable cerberus
 ```
-*Copy the generated `API_KEY`, `API_SECRET`, and `API_PASSPHRASE` and paste them into your `.env` file.*
 
 ---
 
-## 🚀 How to Run
+## 🧠 ML Training Pipeline (Phase 1, 2, 3)
 
-### Step 1: Model Bootstrap (Synthetic Warmup)
-Before the bot can calculate fair value probabilities, you must train the logistic regression coefficients (`betas`).
-Run the synthetic data generator:
-```bash
-python training/synthetic_labels.py
-```
-*Wait for this script to successfully generate `data/betas_btc.npy` and `data/betas_eth.npy`.*
+Cerberus menggunakan model *Logistic Regression* yang dilatih menggunakan data Binance (OHLCV) dan Polymarket.
 
-### Step 2: Start the Engine (Dry Run)
-By default, `.env` should have `DRY_RUN=true`. This allows the engine to connect to all WebSockets, run the ML models, and log decisions *without* placing real money orders.
+Proses **Setup Awal (Otomatis dilakukan oleh `vps_setup.sh`)**:
 ```bash
-python main.py
-```
-Verify that the logs show healthy connections and no fatal errors.
+# 1. Download 90 hari data OHLCV dari Binance (Tanpa API Key)
+python3 training/historical_downloader.py --days 90 --asset BTC
+python3 training/historical_downloader.py --days 90 --asset ETH
 
-### Step 3: Go Live
-Once you are confident in the system's stability, edit `.env`:
-```env
-DRY_RUN=false
+# 2. Train Model dengan Synthetic Labels
+python3 training/train_model.py --asset BTC
+python3 training/train_model.py --asset ETH
+
+# 3. Validasi Brier Score
+python3 training/model_validator.py --mode model_performance --asset BTC
 ```
-Then restart the engine:
-```bash
-python main.py
-```
+
+**Brier Score Thresholds:**
+* **WARMUP Phase (< 5000 real samples):** Target `< 0.22` (Sedikit lebih longgar karena label sintetis tidak mengandung microstructure noise seperti spread dan slippage).
+* **LIVE Phase (≥ 5000 real samples):** Target ketat `< 0.20`.
+* Jadwal Retrain: Berjalan otomatis setiap jam 02:00 UTC melalui `training/blended_trainer.py`.
 
 ---
 
 ## 📊 Monitoring System
 
-Cerberus V3.2 features a 3-Level Reporting architecture to keep you informed 24/7.
+Cerberus V3.2 memiliki 3-Level Reporting architecture kelas SRE.
 
-### Level 1: Mission Control Dashboard (React)
-A real-time, highly visual web dashboard showing live PnL, latency metrics, WebSocket health, and GhostShield status.
-To run the dashboard:
+### Level 1: TUI Mission Control (Terminal Dashboard)
+Dashboard *real-time* berbasis terminal yang menampilkan live PnL, latency metrics, WebSocket health, Risk Brain, dan GhostShield.
+**Cara akses di VPS:**
 ```bash
-cd reporting/dashboard
-npm install
-npm run dev
+cd /root/cerberus
+source .venv/bin/activate
+python3 reporting/dashboard.py
 ```
-Then open `http://localhost:5173` in your browser.
+*(Tersedia juga `python3 reporting/dashboard.py --demo` untuk melihat UI menggunakan data mock).*
 
 ### Level 2: Per-Session JSONL Dumps
-Every market window (5M, 15M, 1H), the bot automatically dumps a full state snapshot to `logs/sessions/`. This data can be used for deep retrospective analysis and model recalibration.
+Setiap market window selesai, bot membuang snapshot state (PnL, Brier score, fill rates) ke `logs/sessions/` dengan format JSON yang strict untuk keperluan *post-mortem analysis*.
 
 ### Level 3: Daily Telegram Digest
-Cerberus will automatically push a daily summary to your Telegram at 00:00 UTC containing Gross PnL, Win Rate, and Total Orders.
-To test this notification manually at any time, run:
+Bot mengirimkan rekap harian ke Telegram (Total Trades, Win Rate, Ghost Rate, Brier Score OOS) setiap jam 00:00 UTC.
+Untuk mengetes pengiriman report kapan saja:
 ```bash
-python reporting/daily_digest.py --test
+python3 reporting/daily_digest.py --preview
 ```
 
 ---
+### ⚠️ PRE-FLIGHT CHECKLIST (Sebelum DRY_RUN=false)
+1. Brier Score OOS harus `< 0.20` selama 3 hari berturut-turut.
+2. Hit endpoint `GET https://clob.polymarket.com/fee-config` secara manual untuk memverifikasi bahwa konstanta fee `C_CRYPTO` benar-benar `0.9984` (1.56%).
+3. Ghost Rate harian konsisten di bawah 3%.
+
 *Developed for elite probabilistic arbitrage. May the odds be overwhelmingly in your favor.*
